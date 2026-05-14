@@ -1,5 +1,3 @@
-
-
 from pyscf import gto
 import numpy as np
 def concentric_occ_localization(dmet, proj_bas, n_shell, atoms_A, couple_op='hcore',
@@ -428,6 +426,71 @@ def concentric_vir_localization(dmet, proj_bas, n_shell, atoms_A, couple_op='hco
 
     return dmet
 def localize_spaces(dmet, method='boys', spin='alpha'):
+    if spin == 'alpha':
+        s = 0
+    elif spin == 'beta':
+        s = 1
+    else:
+        raise ValueError(f"spin must be 'alpha' or 'beta', got {spin}")
+    dmet.log.info("[%s] ====== Orthogonality check before %s localization ======", spin, method.upper())
+    _export_molden_orbital(dmet, spin=spin, suffix="before_loc")
+    def check_orthogonal():
+        S = dmet.mf_or_cas.get_ovlp()
+
+        def _max_offdiag(M, label):
+            """Return max absolute off-diagonal element of M^T @ S @ M."""
+            if M.shape[1] <= 1:
+                return 0.0
+            ovlp = M.T.conj() @ S @ M
+            diag = np.diag(np.diag(ovlp))
+            offdiag = np.max(np.abs(ovlp - diag))
+            dmet.log.info("[%s] %s: max|offdiag| = %.2e, max|diag-1| = %.2e",
+                        spin, label, offdiag, np.max(np.abs(np.diag(ovlp) - 1.0)))
+            return offdiag
+
+        def _inter_block_orth(M1, M2, label1, label2):
+            """Check orthogonality between two blocks: M1^T @ S @ M2."""
+            if M1.shape[1] == 0 or M2.shape[1] == 0:
+                return 0.0
+            ovlp = M1.T.conj() @ S @ M2
+            maxel = np.max(np.abs(ovlp))
+            dmet.log.info("[%s] Inter-block <%s|%s>: max|ovlp| = %.2e", spin, label1, label2, maxel)
+            return maxel
+        nimp = len(dmet.imp_idx)
+        bath_ao = dmet.es_orb[s][:, nimp:]
+        fo_ao = dmet.fo_orb[s]
+        fv_ao = dmet.fv_orb[s]
+
+
+
+        # Intra-block: bath-AO (excluding impurity), FO, FV
+        _max_offdiag(bath_ao, 'bath (intra)')
+        _max_offdiag(fo_ao, 'fo (intra)')
+        _max_offdiag(fv_ao, 'fv (intra)')
+
+        # Full embedding space (ES = impurity + bath)
+        es_ao = dmet.es_orb[s]
+        _max_offdiag(es_ao, 'ES (full, intra)')
+
+        # Inter-block: bath vs FO, bath vs FV, FO vs FV
+        _inter_block_orth(bath_ao, fo_ao, 'bath', 'fo')
+        _inter_block_orth(bath_ao, fv_ao, 'bath', 'fv')
+        _inter_block_orth(fo_ao, fv_ao, 'fo', 'fv')
+
+        # Impurity vs bath (impurity orthogonality to new bath)
+        imp_ao = dmet.es_orb[s][:, :nimp]
+        _inter_block_orth(imp_ao, bath_ao, 'imp', 'bath')
+
+        # Full orbital set (all lo_cloes columns)
+        full_lo = dmet.lo_cloes[s]
+        # Check LO-basis orthogonality: lo_cloes^T @ cloao^T @ S @ caolo @ lo_cloes = I
+        # Since caolo^T @ S @ caolo = I (LO basis is orthonormal), this reduces to
+        # lo_cloes^T @ lo_cloes, but we use AO metric for safety:
+        full_ao = dmet.caolo @ full_lo
+        _max_offdiag(full_ao, 'FULL lo_cloes (intra)')
+
+        dmet.log.info("[%s] ====== Orthogonality check done ======", spin)
+
 
     def localize_subspace(coeff_AO, name):
         from pyscf import lo
@@ -452,12 +515,6 @@ def localize_spaces(dmet, method='boys', spin='alpha'):
     if dmet.lo_cloes is None:
         raise RuntimeError("Run build() first before localization.")            
     dmet.log.info(f"Performing {method.upper()} localization on Env subspaces (Bath, FO, FV)...")
-    if spin == 'alpha':
-        s = 0
-    elif spin == 'beta':
-        s = 1
-    else:
-        raise ValueError(f"spin must be 'alpha' or 'beta', got {spin}")
 
     nimp = len(dmet.imp_idx)
     nbath = dmet.nes[s] - nimp
@@ -477,6 +534,8 @@ def localize_spaces(dmet, method='boys', spin='alpha'):
     ## fo 
     fo_AO = dmet.caolo @ dmet.lo_cloes[s][:, nimp+nbath : nimp+nbath+nfo_s]
 
+    print(f"[{spin}] Before localization: \nbath_AO shape: {bath_AO.shape}, nbath={nbath}; \n")
+
     dmet.log.info(f"[{spin}] fo_AO shape: {fo_AO.shape}, nfo={nfo_s}")
 
     bath_loc_AO = localize_subspace(bath_AO, 'bath')
@@ -493,64 +552,86 @@ def localize_spaces(dmet, method='boys', spin='alpha'):
     dmet.fo_orb = (dmet.caoes[0][:, dmet.nes[0]:dmet.nes[0]+dmet.nfo[0]], dmet.caoes[1][:, dmet.nes[1]:dmet.nes[1]+dmet.nfo[1]])
     dmet.fv_orb = (dmet.caoes[0][:, dmet.nes[0]+dmet.nfo[0]:dmet.nes[0]+dmet.nfo[0]+dmet.nfv[0]], dmet.caoes[1][:, dmet.nes[1]+dmet.nfo[1]:dmet.nes[1]+dmet.nfo[1]+dmet.nfv[1]])
 
-    # ---- check the orthogonality of new orbitals ----
-    S = dmet.mf_or_cas.get_ovlp()
-    bath_ao = dmet.es_orb[s][:, nimp:]
-    fo_ao = dmet.fo_orb[s]
-    fv_ao = dmet.fv_orb[s]
-
-    def _max_offdiag(M, label):
-        """Return max absolute off-diagonal element of M^T @ S @ M."""
-        if M.shape[1] <= 1:
-            return 0.0
-        ovlp = M.T.conj() @ S @ M
-        diag = np.diag(np.diag(ovlp))
-        offdiag = np.max(np.abs(ovlp - diag))
-        dmet.log.info("[%s] %s: max|offdiag| = %.2e, max|diag-1| = %.2e",
-                      spin, label, offdiag, np.max(np.abs(np.diag(ovlp) - 1.0)))
-        return offdiag
-
-    def _inter_block_orth(M1, M2, label1, label2):
-        """Check orthogonality between two blocks: M1^T @ S @ M2."""
-        if M1.shape[1] == 0 or M2.shape[1] == 0:
-            return 0.0
-        ovlp = M1.T.conj() @ S @ M2
-        maxel = np.max(np.abs(ovlp))
-        dmet.log.info("[%s] Inter-block <%s|%s>: max|ovlp| = %.2e", spin, label1, label2, maxel)
-        return maxel
 
     dmet.log.info("[%s] ====== Orthogonality check after %s localization ======", spin, method.upper())
 
-    # Intra-block: bath-AO (excluding impurity), FO, FV
-    _max_offdiag(bath_ao, 'bath (intra)')
-    _max_offdiag(fo_ao, 'fo (intra)')
-    _max_offdiag(fv_ao, 'fv (intra)')
+    check_orthogonal()
 
-    # Full embedding space (ES = impurity + bath)
-    es_ao = dmet.es_orb[s]
-    _max_offdiag(es_ao, 'ES (full, intra)')
-
-    # Inter-block: bath vs FO, bath vs FV, FO vs FV
-    _inter_block_orth(bath_ao, fo_ao, 'bath', 'fo')
-    _inter_block_orth(bath_ao, fv_ao, 'bath', 'fv')
-    _inter_block_orth(fo_ao, fv_ao, 'fo', 'fv')
-
-    # Impurity vs bath (impurity orthogonality to new bath)
-    imp_ao = dmet.es_orb[s][:, :nimp]
-    _inter_block_orth(imp_ao, bath_ao, 'imp', 'bath')
-
-    # Full orbital set (all lo_cloes columns)
-    full_lo = dmet.lo_cloes[s]
-    # Check LO-basis orthogonality: lo_cloes^T @ cloao^T @ S @ caolo @ lo_cloes = I
-    # Since caolo^T @ S @ caolo = I (LO basis is orthonormal), this reduces to
-    # lo_cloes^T @ lo_cloes, but we use AO metric for safety:
-    full_ao = dmet.caolo @ full_lo
-    _max_offdiag(full_ao, 'FULL lo_cloes (intra)')
-
-    dmet.log.info("[%s] ====== Orthogonality check done ======", spin)
+    # Export localized orbitals to Molden file (keep imp/bath/fo/fv order)
+    _export_molden_orbital(dmet, spin=spin, suffix=f"localized_{method}")
 
     dmet.log.info("Environment subspaces localized successfully.")
     return dmet
+
+
+def _export_molden_orbital(dmet, spin='alpha', suffix=None):
+    """
+    Export the full orbital set (imp + bath + FO + FV) for a given spin
+    to a Molden file.  Orbitals are written in their natural order:
+    imp_0 ... imp_{nimp-1}, bath_0 ..., fo_0 ..., fv_0 ...
+    The orbital label and index are printed into the log.
+    """
+    if spin == 'alpha':
+        s = 0
+    elif spin == 'beta':
+        s = 1
+    else:
+        raise ValueError(f"spin must be 'alpha' or 'beta', got {spin}")
+
+    try:
+        from pyscf.tools import molden
+
+        nimp = len(dmet.imp_idx)
+        nbath_s = dmet.nes[s] - nimp
+        nfo_s = dmet.nfo[s]
+        nfv_s = dmet.nfv[s]
+
+        # Build labels in original order (no sorting)
+        mo_labels = (
+            [f'imp_{i}'   for i in range(nimp)] +
+            [f'bath_{i}'  for i in range(nbath_s)] +
+            [f'fo_{i}'    for i in range(nfo_s)] +
+            [f'fv_{i}'    for i in range(nfv_s)]
+        )
+
+        # Build MO coefficients in original order
+        mo_coeff = np.hstack([dmet.es_orb[s], dmet.fo_orb[s], dmet.fv_orb[s]])
+
+        # Occupations from embedded DM (ES only), diagonalize for natural occ
+        mo_occ = np.zeros(mo_coeff.shape[1])
+        occ_loc, _ = np.linalg.eigh(dmet.es_dm[s])
+        mo_occ[:dmet.nes[s]] = occ_loc[::-1]  # descending order
+
+        mo_ene = np.zeros(mo_coeff.shape[1])
+
+        if suffix is None: 
+            suffix_str = ""
+        else:
+            suffix_str = f"_{suffix}"
+
+        molden_filename = f"{dmet.title}{suffix_str}_{spin}.molden"
+        with open(molden_filename, 'w') as f:
+            molden.header(dmet.mol, f)
+            molden.orbital_coeff(dmet.mol, f, mo_coeff,
+                                 ene=mo_ene, occ=mo_occ,
+                                 ignore_h=True)
+
+        dmet.log.info("[%s] Orbitals written to %s", spin, molden_filename)
+
+        # Print orbital mapping table
+        dmet.log.info("[%s] Orbital index —— label mapping (total %d orbitals):",
+                      spin, len(mo_labels))
+        for idx, lbl in enumerate(mo_labels):
+            # Also show occupation if available (non-zero)
+            occ_val = mo_occ[idx]
+            if abs(occ_val) > 1e-10:
+                dmet.log.info("[%s]   %3d  %s   occ=%.4f", spin, idx, lbl, occ_val)
+            else:
+                dmet.log.info("[%s]   %3d  %s", spin, idx, lbl)
+
+    except Exception as e:
+        dmet.log.warn("[%s] Failed to export Molden file: %s", spin, str(e))
+
 
 
 
