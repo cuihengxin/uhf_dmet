@@ -9,7 +9,7 @@ from pyscf.cc import dfuccsd
 from pyscf.mp import dfump2
 from pyscf.ao2mo.incore import _conc_mos
 from pyscf.ao2mo import _ao2mo
-from embed_sim import uhf_tool
+from uhf_dmet import uhf_tool
 
 
 def _ao2mo_df(mycc, mo_coeff=None):
@@ -184,11 +184,11 @@ class DFSSDMET_uhf(uhf_tool.SSDMET_uhf):
             fh5['es_cderi_a'] = np.string_(self.es_cderi[0])
             fh5['es_cderi_b'] = np.string_(self.es_cderi[1])
 
-    def build(self, chk_fname_load='', save_chk=True):
+    def build(self, restore_imp = False, aodmet = False, chk_fname_load='', save_chk=True):
         if not hasattr(self.mf_or_cas, 'with_df') or self.mf_or_cas.with_df is None:
             self.mf_or_cas.with_df = self.with_df
         
-        super().build(chk_fname_load=chk_fname_load, save_chk=save_chk)
+        super().build(restore_imp=restore_imp, chk_fname_load=chk_fname_load, aodmet = aodmet, save_chk=save_chk)
 
         if save_chk:
             self.save_chk(self.title)

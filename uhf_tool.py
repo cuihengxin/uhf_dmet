@@ -411,6 +411,9 @@ class SSDMET_uhf:
         self.es_int1e = None  # tuple (es_int1e_a, es_int1e_b) for UHF
         self.es_int2e = None  # tuple (es_int2e_a, es_int2e_b) for UHF
 
+
+
+
     def svd_build_embedded_space(self,ldm,imp_idx,threshold=1e-8):
         """ Use SVD of Imp-Env block to generate bath for single-spin
         Returns
@@ -421,6 +424,10 @@ class SSDMET_uhf:
         ldm_env_imp = ldm[env_idx,:][:, imp_idx]
         u,s,vh = svd(ldm_env_imp, full_matrices=False) # generating bath from SVD of imp-env block
         
+        print(f"Max s = {s[0]:.6e}, Min kept s = {s[-1]:.6e}, N_bath = {len(s)}")
+        print(f"s ratio: max/min = {s[0]/s[-1]:.2e}")
+        print(f"Sigma", s)
+
         idx = np.where(s > threshold)[0]
         s = s[idx]
         u = u[:,idx]
@@ -484,12 +491,83 @@ class SSDMET_uhf:
 
         return cloes, nimp, nbath, nfo, nfv
 
-    def lowdin_orth(self):
+    def eig_build_embedded_space_ao(self, ldm, imp_idx, lo_meth='lowdin', thres=1e-12):
+
+        env_idx = [x for x in range(ldm.shape[0]) if x not in imp_idx]
+        ldm_imp = ldm[imp_idx,:][:,imp_idx]
+        ldm_env = ldm[env_idx,:][:,env_idx]
+        ldm_imp_env = ldm[imp_idx,:][:,env_idx]
+        ldm_env_imp = ldm[env_idx,:][:,imp_idx]
+
+        occ_env, orb_env = np.linalg.eigh(ldm_env) # occupation and orbitals on environment
+
+        nimp = len(imp_idx)
+        nfv = np.sum(occ_env <  thres) # frozen virtual 
+        nbath = np.sum(((occ_env >= thres) & (occ_env <= 1-thres)) | (occ_env >= 1+thres))  # bath orbital
+        nfo = np.sum((occ_env > 1-thres) & (occ_env < 1 + thres)) # frozen occupied
+
+        # defined w.r.t enviroment orbital index
+        fv_idx = np.nonzero(occ_env <  thres)[0]
+        bath_idx = np.nonzero(((occ_env >= thres) & (occ_env <= 1-thres)) | (occ_env >= 1 +thres))[0]
+        fo_idx = np.nonzero((occ_env > 1-thres) & (occ_env < 1 + thres))[0]
+
+        orb_env = np.hstack((orb_env[:, bath_idx], orb_env[:, fo_idx], orb_env[:, fv_idx]))
+        
+        es_occ = None
+        cloes = block_diag(np.eye(nimp), orb_env)
+        
+        rearange_idx = np.argsort(np.concatenate((imp_idx, env_idx)))
+        cloes = cloes[rearange_idx,:]
+
+        return cloes, nimp, nbath, nfo, nfv
+
+
+    def lowdin_orth(self, restore_imp = False):
         # lowdin orthonormalize of DM for different spin.
         caolo = lowdin(self.mf_or_cas.get_ovlp())
         cloao = caolo @ self.mf_or_cas.get_ovlp()
+        if restore_imp:
+            imp_idx = self.imp_idx
+            mask_env = np.ones(len(caolo), dtype=bool)
+            mask_env[imp_idx] = False
+
+            Q1 = cloao[:, imp_idx]
+            Q1, _ = np.linalg.qr(Q1) # orthonormalize
+            P = np.eye(*cloao.shape) - Q1 @ Q1.T.conj()
+            B = P @ cloao[:, mask_env]
+            from scipy.linalg import svd
+            U, S, Vh = svd(B, full_matrices=False)
+
+            Q = np.zeros(cloao.shape)
+            Q[:, imp_idx] = Q1
+            Q[:, mask_env] = U[:, 0: cloao.shape[0] - len(imp_idx)]
+            cloao = Q.T.conj() @ cloao
+            caolo = caolo @ Q
         ldm = np.einsum('ij,sjk,kl->sil',cloao, self.dm, cloao.conj().T)
         return ldm[0],ldm[1], caolo, cloao
+    def lowdin_orth_ao(self, ovlp=None):
+        if ovlp is None :
+            S = self.mf_or_cas.mol.intor_symmetric('int1e_ovlp')
+        else:
+            S = ovlp
+        env_idx = np.array([x for x in range(self.mf_or_cas.mol.nao) if x not in self.imp_idx])
+        S_env = S[env_idx][:, env_idx]
+        caolo = np.eye(self.mf_or_cas.mol.nao)
+        cloao = np.eye(self.mf_or_cas.mol.nao)
+        caolo_env = lowdin(S_env)
+        cloao_env = caolo_env @ S_env
+        caolo[np.ix_(env_idx, env_idx)] = caolo_env
+        cloao[np.ix_(env_idx, env_idx)] = cloao_env
+        ldm = np.einsum('ij,sjk,kl->sil',cloao, self.dm, cloao.conj().T)
+        return ldm[0],ldm[1], caolo, cloao
+
+
+
+
+
+
+
+
 
     def load_chk(self, chk_fname):
         try:
@@ -558,7 +636,7 @@ class SSDMET_uhf:
             fh5['nfo'] = np.array(self.nfo)
         return
 
-    def build(self, chk_fname_load='', save_chk=True):
+    def build(self, restore_imp=False, aodmet = False, chk_fname_load='', save_chk=True):
         '''
         Build Embedding Space and Embedding Space Mean Field Object.
         For UHF 2 different spin space is needed and ERI is not stored.
@@ -568,13 +646,31 @@ class SSDMET_uhf:
         loaded = self.load_chk(chk_fname_load)
 
         if not loaded:
-            ldm0 ,ldm1, caolo, cloao = self.lowdin_orth()
+            if aodmet:
+                self.log.info("******AODMET*******")
+                if restore_imp:
+                    raise NotImplementedError("restore_imp=True is not implemented for AODMET")
+                
+                ldm0 ,ldm1, caolo, cloao = self.lowdin_orth_ao()
+            else:
+                self.log.info("******Lowdin orthogonalization in AO basis LODMET*******")
+                print("******Lowdin orthogonalization in AO basis LODMET*******")
+                ldm0 ,ldm1, caolo, cloao = self.lowdin_orth(restore_imp=restore_imp)
             if self.es_method == 'svd':
-                cloes0, nimp, nbath0, nfo0, nfv0 = self.svd_build_embedded_space(ldm0,self.imp_idx,self.threshold)
-                cloes1, _   , nbath1, nfo1, nfv1 = self.svd_build_embedded_space(ldm1,self.imp_idx,self.threshold)
+                if aodmet:
+                    #cloes0, nimp, nbath0, nfo0, nfv0 = self.svd_build_embedded_space_ao(ldm0, self.imp_idx, self.threshold)
+                    #cloes1, _, nbath1, nfo1, nfv1 = self.svd_build_embedded_space_ao(ldm1, self.imp_idx, self.threshold)
+                    raise NotImplementedError("SVD is not implemented for AODMET")
+                else:
+                    cloes0, nimp, nbath0, nfo0, nfv0 = self.svd_build_embedded_space(ldm0, self.imp_idx, self.threshold)
+                    cloes1, _, nbath1, nfo1, nfv1 = self.svd_build_embedded_space(ldm1, self.imp_idx, self.threshold)
             else:  # es_method == 'eig'
-                cloes0, nimp, nbath0, nfo0, nfv0 = self.eig_build_embedded_space(ldm0,self.imp_idx)
-                cloes1, _   , nbath1, nfo1, nfv1 = self.eig_build_embedded_space(ldm1,self.imp_idx)
+                if aodmet:
+                    cloes0, nimp, nbath0, nfo0, nfv0 = self.eig_build_embedded_space_ao(ldm0, self.imp_idx, self.threshold)
+                    cloes1, _, nbath1, nfo1, nfv1 = self.eig_build_embedded_space_ao(ldm1, self.imp_idx, self.threshold)
+                else:
+                    cloes0, nimp, nbath0, nfo0, nfv0 = self.eig_build_embedded_space(ldm0, self.imp_idx, self.threshold)
+                    cloes1, _, nbath1, nfo1, nfv1 = self.eig_build_embedded_space(ldm1, self.imp_idx, self.threshold)
 
             self.nes = (nimp+nbath0,nimp+nbath1)
             self.nfo = (nfo0,nfo1)
@@ -726,7 +822,7 @@ class SSDMET_uhf:
 
     def density_fit(self, with_df=None):
         """Return a density-fitting enabled UHF DMET object."""
-        from embed_sim.df_uhf_tool import DFSSDMET_uhf
+        from uhf_dmet.df_uhf_tool import DFSSDMET_uhf
         df_dmet = DFSSDMET_uhf(self.mf_or_cas, self.title, imp_idx=self.imp_idx, threshold=self.threshold,
                            bath_option=self.bath_option, es_method=self.es_method, with_df=with_df,
                            verbose=self.verbose)
